@@ -1,0 +1,25 @@
+{
+  "chromium_profile": "~/.config/chromium/Default",
+  "keyring_app": "chromium",
+  "cookie": "",
+  "user_agent": "",
+  "proxy": "",
+  "delay": 3,
+  "retries": 5,
+  "retry_wait": 30,
+  "timeout": 60,
+  "s_mode": ["s_tag", "s_tc"],
+  "mode": "all",
+  "order": "date_d",
+  "max_pages": 0,
+  "types": ["illust", "manga"],
+  "exclude_ai": false,
+  "groups": [
+    {
+      "name": "example",
+      "dir": "downloads/example",
+      "keywords": ["keyword one", "keyword two"],
+      "max_pages": 3
+    }
+  ]
+}
