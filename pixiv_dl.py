@@ -15,7 +15,7 @@ from urllib.parse import quote
 import requests
 
 LOG_NAME = "pixiv-dl.log"
-TYPES = {"illust": 0, "manga": 1}
+WORK_TYPES = {"illust": 0, "manga": 1}
 GROUP_DEFAULTS = {
     "s_mode": ["s_tag", "s_tc"],
     "mode": "all",
@@ -30,10 +30,6 @@ def log(msg):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
 
-def now_iso():
-    return datetime.now().astimezone().isoformat(timespec="seconds")
-
-
 def keyring_password(app):
     try:
         import gi
@@ -41,8 +37,8 @@ def keyring_password(app):
         from gi.repository import Secret
     except (ImportError, ValueError):
         return None
-    for schema_name in ["chrome_libsecret_os_crypt_password_v2", "chrome_libsecret_os_crypt_password_v1"]:
-        schema = Secret.Schema.new(schema_name, Secret.SchemaFlags.DONT_MATCH_NAME, {"application": Secret.SchemaAttributeType.STRING})
+    for name in ["chrome_libsecret_os_crypt_password_v2", "chrome_libsecret_os_crypt_password_v1"]:
+        schema = Secret.Schema.new(name, Secret.SchemaFlags.DONT_MATCH_NAME, {"application": Secret.SchemaAttributeType.STRING})
         password = Secret.password_lookup_sync(schema, {"application": app}, None)
         if password is not None:
             return password
@@ -104,12 +100,20 @@ def parse_cookie_string(text):
 
 def browser_user_agent(profile):
     version_file = Path(profile).expanduser().parent / "Last Version"
-    version = "137.0.0.0"
-    if version_file.exists():
-        major = version_file.read_text().strip().split(".")[0]
-        if major.isdigit():
-            version = f"{major}.0.0.0"
-    return f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version} Safari/537.36"
+    major = version_file.read_text().split(".")[0] if version_file.exists() else ""
+    if not major.isdigit():
+        sys.exit(f"cannot read the browser version from {version_file}, please set user_agent in the config")
+    return f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+
+
+def response_error(r, image):
+    if r.status_code != 200:
+        return f"HTTP {r.status_code}"
+    if image and not r.headers.get("Content-Type", "").startswith("image/"):
+        return "not an image"
+    if image and len(r.content) != int(r.headers.get("Content-Length", len(r.content))):
+        return "incomplete image"
+    return None
 
 
 class Client:
@@ -128,44 +132,39 @@ class Client:
         self.retry_wait = cfg.get("retry_wait", 30)
         self.timeout = cfg.get("timeout", 60)
         self.last = 0
-        self.login_checked = False
+        self.user_id = None
 
-    def wait(self):
-        pause = self.delay * random.uniform(1, 1.5) - (time.time() - self.last)
-        if pause > 0:
-            time.sleep(pause)
-
-    def get(self, url, params=None):
+    def get(self, url, params=None, image=False):
         for attempt in range(self.retries + 1):
-            self.wait()
+            time.sleep(max(0, self.last + self.delay * random.uniform(1, 1.5) - time.time()))
+            r = None
             try:
                 r = self.session.get(url, params=params, timeout=self.timeout)
-                self.last = time.time()
-                if r.status_code == 200:
-                    return r
-                if r.status_code in (400, 404):
-                    raise FileNotFoundError(f"HTTP {r.status_code} {url}")
-                error = f"HTTP {r.status_code}"
+                error = response_error(r, image)
             except requests.RequestException as e:
-                self.last = time.time()
                 error = str(e)
+            self.last = time.time()
+            if error is None:
+                return r
+            if r is not None and r.status_code in (400, 404):
+                raise RuntimeError(f"{error} {url}")
             if attempt < self.retries:
                 wait = self.retry_wait * (attempt + 1)
                 log(f"request failed ({error}), retry in {wait}s: {url}")
                 time.sleep(wait)
         raise RuntimeError(f"giving up after {self.retries + 1} attempts: {url}")
 
-    def api(self, url, params=None):
-        params = dict(params or {}, lang="en")
-        r = self.get(url, params)
-        if not self.login_checked:
-            if not r.headers.get("x-userid"):
-                sys.exit("not logged in, please check the browser cookies")
-            log(f"logged in as user {r.headers['x-userid']}")
-            self.login_checked = True
+    def api(self, path, params=None):
+        r = self.get(f"https://www.pixiv.net/ajax/{path}", dict(params or {}, lang="en"))
+        user_id = r.headers.get("x-userid")
+        if not user_id:
+            sys.exit("not logged in, please log in to pixiv in the browser first")
+        if user_id != self.user_id:
+            log(f"logged in as user {user_id}")
+            self.user_id = user_id
         data = r.json()
         if data.get("error"):
-            raise RuntimeError(f"API error: {data.get('message')} {url}")
+            raise RuntimeError(f"API error: {data.get('message')} {path}")
         return data["body"]
 
 
@@ -173,131 +172,127 @@ def clean_name(name):
     return "".join(c for c in name if c.isalnum())[:50]
 
 
-class Library:
-    def __init__(self, root):
-        self.root = root
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.dirs = {}
-        for p in self.root.iterdir():
-            m = re.match(r"(\d+)(_|$)", p.name)
-            if p.is_dir() and m:
-                self.dirs.setdefault(m.group(1), p)
-        self.states = {}
-
-    def state(self, uid):
-        if uid not in self.states:
-            state = {"done": {}, "skip": set(), "skip_user": False}
-            if uid in self.dirs:
-                log_path = self.dirs[uid] / LOG_NAME
-                if log_path.exists():
-                    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                        parse_line(line, state)
-            self.states[uid] = state
-        return self.states[uid]
-
-    def user_dir(self, uid, name):
-        if uid not in self.dirs:
-            cleaned = clean_name(name)
-            path = self.root / (f"{uid}_{cleaned}" if cleaned else uid)
-            path.mkdir(parents=True, exist_ok=True)
-            self.dirs[uid] = path
-        return self.dirs[uid]
-
-    def record(self, uid, line):
-        with open(self.dirs[uid] / LOG_NAME, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+def new_user(path):
+    return {"dir": path, "done": {}, "skip": set(), "skip_user": False}
 
 
-def parse_line(line, state):
+def parse_line(line, user):
     parts = line.split()
-    if not parts or parts[0].startswith("#"):
-        return
-    cmd, args = parts[0], parts[1:]
-    if cmd == "done" and len(args) >= 3 and args[0].isdigit():
-        state["done"][args[0]] = args[2]
-    elif cmd == "skip":
-        state["skip"].update(a for a in args if a.isdigit())
-    elif cmd == "skip_user":
-        state["skip_user"] = True
+    if len(parts) >= 4 and parts[0] == "done" and parts[1].isdigit():
+        user["done"][parts[1]] = parts[3]
+    elif parts and parts[0] == "skip":
+        user["skip"].update(p for p in parts[1:] if p.isdigit())
+    elif parts and parts[0] == "skip_user":
+        user["skip_user"] = True
 
 
-def search_pages(client, word, s_mode, opts):
+def load_users(root):
+    users = {}
+    for path in sorted(root.iterdir()):
+        m = re.match(r"(\d+)(_|$)", path.name)
+        if not (path.is_dir() and m):
+            continue
+        if m.group(1) in users:
+            log(f"warning: {path.name} and {users[m.group(1)]['dir'].name} belong to the same user, logs are merged")
+        user = users.setdefault(m.group(1), new_user(path))
+        log_path = path / LOG_NAME
+        if log_path.exists():
+            for line in log_path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+                parse_line(line, user)
+    return users
+
+
+def append_log(user, line):
+    path = user["dir"] / LOG_NAME
+    tail = path.read_bytes()[-1:] if path.exists() else b""
+    if tail not in (b"", b"\n"):
+        line = "\n" + line
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def newer(a, b):
+    try:
+        return datetime.fromisoformat(a) > datetime.fromisoformat(b)
+    except (TypeError, ValueError):
+        return False
+
+
+def search(client, word, s_mode, opts):
     page = 1
     while True:
-        params = {
-            "word": word,
-            "order": opts["order"],
-            "mode": opts["mode"],
-            "s_mode": s_mode,
-            "type": "all",
-            "p": page,
-        }
-        body = client.api(f"https://www.pixiv.net/ajax/search/artworks/{quote(word, safe='')}", params)
-        result = body["illustManga"]
-        items = [d for d in result["data"] if isinstance(d, dict) and d.get("id")]
-        last = result.get("lastPage", page)
-        total = result.get("total", 0)
+        params = {"word": word, "order": opts["order"], "mode": opts["mode"], "s_mode": s_mode, "type": "all", "p": page}
+        result = client.api(f"search/artworks/{quote(word, safe='')}", params)["illustManga"]
+        last, total = result["lastPage"], result["total"]
         log(f"search '{word}' ({s_mode}) page {page}/{last}, total {total}")
         if page == 1 and total > last * 60:
             log(f"warning: search '{word}' ({s_mode}) is capped at {last} pages, only about {last * 60} of {total} works are reachable")
-        if not items:
-            return
-        yield items
-        if page >= last or (opts["max_pages"] and page >= opts["max_pages"]):
+        items = [d for d in result["data"] if isinstance(d, dict) and d.get("id")]
+        yield from items
+        if not items or page >= last or page == opts["max_pages"]:
             return
         page += 1
 
 
-def download_work(client, lib, item):
-    wid, uid = str(item["id"]), str(item["userId"])
-    pages = client.api(f"https://www.pixiv.net/ajax/illust/{wid}/pages")
-    user_dir = lib.user_dir(uid, item.get("userName", ""))
-    for i, page in enumerate(pages):
+def download_work(client, root, user, item):
+    wid, uid, name = str(item["id"]), str(item["userId"]), clean_name(item.get("userName", ""))
+    update = item["updateDate"]
+    images = []
+    for i, page in enumerate(client.api(f"illust/{wid}/pages")):
         url = page["urls"]["original"]
         if not url:
-            raise RuntimeError(f"no original url for {wid} page {i}")
-        path = user_dir / f"{wid}_{i}.{url.rsplit('.', 1)[-1]}"
-        if path.exists():
-            continue
-        data = client.get(url).content
+            raise RuntimeError(f"no original url for page {i}")
+        images.append((f"{wid}_{i}", url.rsplit(".", 1)[-1], client.get(url, image=True).content))
+    pages = len(images)
+    if user["dir"] is None:
+        user["dir"] = root / (f"{uid}_{name}" if name else uid)
+        user["dir"].mkdir(exist_ok=True)
+    previous = user["done"].get(wid)
+    if previous:
+        old = {hashlib.sha256(p.read_bytes()).digest() for p in user["dir"].glob(f"{wid}_*") if p.suffix != ".part"}
+        stamp = datetime.fromisoformat(update).strftime("%Y%m%dT%H%M%S")
+        images = [(f"{stem}_{stamp}", ext, data) for stem, ext, data in images if hashlib.sha256(data).digest() not in old]
+    for stem, ext, data in images:
+        path = user["dir"] / f"{stem}.{ext}"
         tmp = path.with_name(path.name + ".part")
         tmp.write_bytes(data)
         tmp.replace(path)
-    update = item.get("updateDate") or item.get("createDate") or "-"
-    lib.record(uid, f"done {wid} {len(pages)} {update} {now_iso()}")
-    lib.state(uid)["done"][wid] = update
-    log(f"downloaded {wid} ({len(pages)} pages) by {uid} {item.get('userName', '')}")
+    append_log(user, f"done {wid} {pages} {update} {datetime.now().astimezone().isoformat(timespec='seconds')}")
+    user["done"][wid] = update
+    if previous:
+        log(f"updated {wid} ({len(images)} new of {pages} pages) by {uid} {name}")
+    else:
+        log(f"downloaded {wid} ({pages} pages) by {uid} {name}")
 
 
 def run_group(client, cfg, group, base):
     opts = {k: group.get(k, cfg.get(k, v)) for k, v in GROUP_DEFAULTS.items()}
-    types = {TYPES[t] for t in opts["types"]}
+    types = {WORK_TYPES[t] for t in opts["types"]}
     root = (base / Path(group["dir"]).expanduser()).resolve()
-    lib = Library(root)
+    root.mkdir(parents=True, exist_ok=True)
+    users = load_users(root)
     seen = set()
-    stats = {"new": 0, "known": 0, "skipped": 0, "failed": 0}
+    stats = {"new": 0, "updated": 0, "known": 0, "skipped": 0, "failed": 0}
     log(f"group '{group.get('name', group['dir'])}' -> {root}")
     for word, s_mode in [(w, m) for w in group["keywords"] for m in opts["s_mode"]]:
-        for items in search_pages(client, word, s_mode, opts):
-            for item in items:
-                wid, uid = str(item["id"]), str(item["userId"])
-                if wid in seen:
-                    continue
-                seen.add(wid)
-                if item.get("illustType") not in types or (opts["exclude_ai"] and item.get("aiType") == 2):
-                    stats["skipped"] += 1
-                    continue
-                state = lib.state(uid)
-                if state["skip_user"] or wid in state["skip"]:
-                    stats["skipped"] += 1
-                    continue
-                if wid in state["done"]:
-                    stats["known"] += 1
-                    continue
+        for item in search(client, word, s_mode, opts):
+            wid, uid = str(item["id"]), str(item["userId"])
+            if wid in seen:
+                continue
+            seen.add(wid)
+            user = users.setdefault(uid, new_user(None))
+            done = user["done"].get(wid)
+            if item.get("illustType") not in types or (opts["exclude_ai"] and item.get("aiType") == 2):
+                stats["skipped"] += 1
+            elif user["skip_user"] or wid in user["skip"]:
+                stats["skipped"] += 1
+            elif done and not newer(item.get("updateDate"), done):
+                stats["known"] += 1
+            else:
                 try:
-                    download_work(client, lib, item)
-                    stats["new"] += 1
-                except (RuntimeError, FileNotFoundError, KeyError, TypeError, ValueError) as e:
+                    download_work(client, root, user, item)
+                    stats["updated" if done else "new"] += 1
+                except (RuntimeError, KeyError, TypeError, ValueError) as e:
                     stats["failed"] += 1
                     log(f"failed {wid}: {e}")
     log(f"group done: {stats}")
@@ -316,9 +311,9 @@ def main():
     else:
         cookies = chromium_cookies(profile, cfg.get("keyring_app", "chromium"))
     client = Client(cfg, cookies, cfg.get("user_agent") or browser_user_agent(profile))
-    groups = [g for g in cfg["groups"] if not args.groups or g.get("name") in args.groups]
-    for group in groups:
-        run_group(client, cfg, group, config_path.parent)
+    for group in cfg["groups"]:
+        if not args.groups or group.get("name") in args.groups:
+            run_group(client, cfg, group, config_path.parent)
 
 
 if __name__ == "__main__":
